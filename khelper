@@ -1,0 +1,323 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'yaml'
+require 'erb'
+$banner="\
+khelper, The Kitchen Helper.
+Speed up the test-kitchen process by not uploading all the files before running
+chef-client. This starts the chef-client run against the chef-zero on the server.
+
+## Usage
+After converging in test-kitchen (minimally the converge must upload the cookbooks
+and start the recipe runs) use khelper to login,scp or run chef-client
+
+  * khelper --help
+  * khelper login --help
+  * khelper scp --help
+  * khelper chef-client --help
+
+## use case
+Converge your cookbook, make any changes to your cookbook or an upstream
+cookbook (av-jas, av-java, etc). Use khelper login to verify a setting
+
+  * khelper login -u root
+
+Realize you need to update the av-jas cookbook and your local cookbook.
+
+  * khelper scp -c .
+  * khelper scp -c ../aw-jas
+  * khelper chef-client
+
+Edit your databag to change the password and upload the data_bags
+
+  * khelper scp -d ../data_bags
+  * khelper chef-client
+
+## sample commands
+
+  * khelper login -u root
+  * khelper scp -c .
+  * khelper scp -d ../data_bags
+  * khelper chef-client
+
+### Options
+
+These options are availalbe for all sub commands
+
+"
+
+
+def parse_yaml(yml_file)
+  YAML.load(ERB.new(File.read(yml_file)).result)
+end
+
+def formatted_duration total_seconds
+  hours = (total_seconds / (60 * 60)).to_i
+  minutes = ((total_seconds / 60) % 60).to_i
+  seconds = (total_seconds % 60).to_i
+  "#{ hours }h #{ minutes }m #{ seconds }s"
+end
+
+# supports EC2 right now, finds the info we need to login
+def get_cookbook_yaml_info()
+  cookbook_keys = {'username' => nil, 'ssh_key' => nil }
+  cookbook_suites = []
+  kitchen_yaml = '.kitchen.yml'
+  kitchen_yaml = ENV['KITCHEN_YAML'] if ENV['KITCHEN_YAML']
+  kitchen_local_yaml = '.kitchen.local.yml'
+  kitchen_local_yaml = ENV['KITCHEN_LOCAL_YAML'] if ENV['KITCHEN_LOCAL_YAML']
+  [ "#{kitchen_local_yaml}", "#{kitchen_yaml}" ].each do |yml_file|
+    if File.exist?(yml_file)
+      cookbook_items = parse_yaml(yml_file)
+      if cookbook_items.key?('suites')
+        cookbook_items['suites'].each do |suite|
+          cookbook_suites.push suite['name']
+        end
+      end
+      %w[ http_proxy https_proxy no_proxy ].each do |prox_key|
+        if cookbook_items.key?('driver')
+          cookbook_keys[prox_key] = cookbook_items['driver'][prox_key]
+        end
+      end
+      %w[ username ssh_key ].each do |trans_key|
+        if cookbook_keys.has_key?(trans_key)
+          if cookbook_items.has_key?('transport')
+            cookbook_keys[trans_key] = cookbook_items['transport'][trans_key]
+          end
+        end
+      end
+    end
+  end
+  cookbook_keys['suites'] = cookbook_suites
+  return cookbook_keys
+end
+
+# figure out all the info we need to connect to a runnign box (vagrant/ec2 tested)
+def get_connection_info(suite)
+  connection_info = {}
+  os_file_yaml = Dir.glob(".kitchen/*#{suite}*.yml")
+  if os_file_yaml[0].nil?
+    raise ".kitchen/*#{suite}*.yml is missing"
+  end
+  os_items = parse_yaml(os_file_yaml[0])
+  connection_info.merge! get_cookbook_yaml_info()
+  # we got this hostname fro m our .kitchen/suite.yml file
+  connection_info['hostname'] = os_items['hostname']
+  if os_items['server_id']
+    # if server_id is in our yaml then its a ec2
+    # get this info from the .kitchen*yml files
+    connection_info['port'] = '22'
+  else
+    # assume its vagrant which puts everything we need in the suite yaml
+    connection_info['ssh_key'] = os_items['ssh_key']
+    connection_info['username'] = os_items['username']
+    connection_info['port'] = os_items['port']
+  end
+  if connection_info['ssh_key'].nil? || connection_info['username'].nil? ||
+    connection_info['port'].nil? || connection_info['hostname'].nil?
+    raise ArgumentError.new("connection_info is incomplete \n#{connection_info}" +
+    " Possibly missing .kitchen.yml .kitchen.local.yml or settings are wrong" )
+  end
+  return connection_info
+end
+
+# returns a list of files in a dir (cookbook dir)
+def get_sub_dirs(cookbook_dir)
+  if File.file?(cookbook_dir)
+    # if the cookbook_dir is a file, then just return the file
+    files = cookbook_dir
+  else
+    # this gives us everything but files starting with .
+    files = (Dir.glob "#{cookbook_dir}/{[!.]}*").join(" ")
+  end
+  return files
+end
+
+# builds a login command, acts differently if you haev a command to run or just a login
+def login(options)
+  optional_command = options[:command] || ''
+  puts "Connecting to #{options[:connection_info]['username']}@#{options[:connection_info]['hostname']}"
+  additional_things = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=error"
+  # get proxy settings
+  no_proxy = options[:connection_info]['no_proxy']
+  http_proxy = options[:connection_info]['http_proxy']
+  https_proxy = options[:connection_info]['https_proxy']
+  prox_things = ''
+  prox_things += "export NO_PROXY=#{no_proxy};" unless no_proxy.nil?
+  prox_things += "export no_proxy=#{no_proxy};" unless no_proxy.nil?
+  prox_things += "export HTTP_PROXY=#{http_proxy};" unless http_proxy.nil?
+  prox_things += "export http_proxy=#{http_proxy};" unless http_proxy.nil?
+  prox_things += "export HTTPS_PROXY=#{https_proxy};" unless https_proxy.nil?
+  prox_things += "export https_proxy=#{https_proxy};" unless https_proxy.nil?
+  tty = '-t'
+  if options[:user]
+    if optional_command != ''
+      # tty = '-T'
+      optional_command = "#{prox_things} sudo -E -u #{options[:user]} #{optional_command}"
+    else
+      optional_command = "#{prox_things} sudo -E su -m #{options[:user]}"
+    end
+  else
+    if optional_command != ''
+      tty = '-T'
+      optional_command = "#{prox_things} #{optional_command}"
+    else
+      optional_command = "#{prox_things} bash"
+    end
+  end
+  command = "ssh -i #{options[:connection_info]['ssh_key']} " +
+            "#{tty} #{options[:connection_info]['username']}@#{options[:connection_info]['hostname']} " +
+            "-p#{options[:connection_info]['port']} #{additional_things} '#{optional_command}'"
+  puts command if options[:verbose]
+  start_time = Time.now
+  run_output = system(command)
+  total_time = Time.now - start_time
+  puts "-------> khelper finished in #{formatted_duration(total_time)} seconds"
+end
+
+# SCPs the file/dir up to the specified location
+def scp_up(options, from, to)
+  additional_things = "-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -q"
+  if File.exist?(from)
+    # we need to know if the directory exists
+    if File.directory?(from)
+      puts "Verifying #{to} exists on #{options[:connection_info]['hostname']}"
+      options[:command] = "mkdir -p #{to}"
+      login(options)
+    end
+    dirs_to_up = get_sub_dirs(from)
+    command = "scp -P #{options[:connection_info]['port']} -i " +
+              "#{options[:connection_info]['ssh_key']} " +
+              "#{additional_things} " +
+              "-rp #{dirs_to_up} " +
+              "#{options[:connection_info]['username']}@#{options[:connection_info]['hostname']}:#{to} "
+    puts command if options[:verbose]
+    puts "Copying #{from} to #{options[:connection_info]['username']}@#{options[:connection_info]['hostname']}:#{to}"
+    run_output = system(command)
+  else
+    raise "#{from} not found, try a valid object"
+  end
+end
+
+# builds the SCP command
+def scp(options)
+  if options[:cookbook_dir]
+    dirname = File.basename(File.expand_path(options[:cookbook_dir]))
+    scp_up(options, options[:cookbook_dir], "/tmp/kitchen/cookbooks/#{dirname}")
+  elsif options[:databag_dir]
+    scp_up(options, options[:databag_dir], "/tmp/kitchen/data_bags/#{dirname}")
+  end
+end
+
+# this allows us to upload a custom run list
+# will not use attributes from .kitchen (TODO)
+def run_custom_run_list(options)
+  local_dna_json = 'dna.json.custom-dev'
+  remote_dna_json = "/tmp/#{local_dna_json}"
+  puts "editing #{local_dna_json}"
+  myfile = File.open(local_dna_json, 'w')
+  myfile.write("{\"run_list\":[\"#{options[:runlist]}\"]}")
+  myfile.close
+  scp_up(options, local_dna_json, remote_dna_json)
+  options[:user] = 'root'
+  options[:command] = "chef-client --local-mode --config /tmp/kitchen/client.rb --log_level auto --force-formatter --json-attributes #{remote_dna_json} --chef-zero-port 8889"
+  return options
+end
+
+def main()
+
+  options = {}
+
+  subcommands = {
+    'login' => OptionParser.new do |opts|
+        opts.banner = "Usage: login [options]"
+        opts.on('-c', '--command=\'command\'', 'command we want to execute must be in \'s, \'echo hi\'') do |v|
+          options[:command] = v
+        end
+        opts.on('-u', '--user=user', 'user to su to') do |v|
+          options[:user] = v
+        end
+        opts.on('--runlist=recipe[cookbook:recipe]', 'set this to a full run list to temp run (recipe[local-dev::local_shib])') do |v|
+          options[:runlist] = v
+        end
+    end,
+    'scp' => OptionParser.new do |opts|
+       opts.banner = "Usage: scp [options]"
+       opts.on('-c', '--cookbook COOKBOOK_DIR', 'cookbook directory to upload to server, using relative or absolute path') do |v|
+         options[:cookbook_dir] = v
+       end
+       opts.on('-d', '--databag DATABAG_DIR', 'path to databag to upload, this is the entire data_bag folder, not a specific databag') do |v|
+          options[:databag_dir] = v
+        end
+    end,
+    'chef-client' => OptionParser.new do |opts|
+      opts.banner = "Usage: chef-client [options]"
+      opts.on('-l', '----log_level=log_level', 'log level to output debug, info, warn, error, and fatal') do |v|
+        options[:log_level] = v
+      end
+    end
+  }
+
+  subtext = "required subcommands: #{subcommands.keys} " +
+    "\nrun each subcommand with -h to get additional help on that subcommand"
+
+  global = OptionParser.new do |opts|
+    opts.banner = $banner
+      "\nUsage: #{__FILE__} [options] [subcommand [options]]"
+    opts.version = '0.0.6.6.6'
+    opts.on("-v", "--verbose", "Run verbosely, shows the ssh commands") do |v|
+      options[:verbose] = v
+    end
+    opts.on('-s', '--suite suite_name', 'Suite Name you want to connect to') do |suite|
+      options[:suite] = suite
+    end
+    # No argument, shows at tail.  This will print an options summary.
+    opts.on('-h', "--help", "Show this message") do
+      puts opts
+      exit
+    end
+    opts.separator subtext
+  end
+
+  # test our commands and order our output
+  # this order! thing is how the subcommand magic works
+  if ARGV[0]
+    global.order!
+    command = ARGV.shift
+    if !command
+      puts global
+      exit
+    else
+      subcommands[command].order!
+    end
+  end
+
+  options[:connection_info] = get_connection_info(options[:suite])
+  case command
+  when 'login'
+    if options[:runlist]
+      puts "Running with #{options[:runlist]}"
+      options = run_custom_run_list(options)
+    end
+    login(options)
+  when "scp"
+    if (!options[:cookbook_dir] && !options[:databag_dir])
+      puts subcommands[command]
+    else
+      scp(options)
+    end
+  when "chef-client"
+    log_level = options[:log_level] || 'auto'
+    options[:user] = 'root'
+    options[:command] = "chef-client --local-mode --config /tmp/kitchen/client.rb --log_level #{log_level} --force-formatter --json-attributes /tmp/kitchen/dna.json --chef-zero-port 8889"
+    login(options)
+  else
+    puts "unknown subcommand #{command.inspect}"
+    puts global
+    exit
+  end
+
+end
+
+main()
